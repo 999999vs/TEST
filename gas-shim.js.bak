@@ -1,0 +1,311 @@
+/**
+ * GAS-SHIM — Lớp giả lập Google Apps Script cho môi trường Node.js
+ * Cho phép file code.js (viết cho Google Apps Script) chạy nguyên bản trên máy chủ nội bộ.
+ * Dữ liệu các "sheet" được lưu vào file JSON: data/garage-data.json
+ */
+'use strict';
+const fs = require('fs');
+const path = require('path');
+
+const DATA_DIR = path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'garage-data.json');
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const TIMEZONE = 'GMT+7'; // Việt Nam
+const TZ_OFFSET_MIN = 7 * 60;
+
+// ─────────────────────────────────────────────────────────
+//  LƯU / ĐỌC DỮ LIỆU (JSON, giữ nguyên kiểu Date)
+// ─────────────────────────────────────────────────────────
+function jsonReplacer(key, value) {
+  const orig = this[key];
+  if (orig instanceof Date) return { __date: orig.toISOString() };
+  return value;
+}
+function jsonReviver(key, value) {
+  if (value && typeof value === 'object' && typeof value.__date === 'string') {
+    return new Date(value.__date);
+  }
+  return value;
+}
+
+// ─────────────────────────────────────────────────────────
+//  RANGE — vùng ô (1-based như Google Sheets)
+// ─────────────────────────────────────────────────────────
+class Range {
+  constructor(sheet, row, col, numRows, numCols) {
+    this.sheet = sheet;
+    this.row = row; this.col = col;
+    this.numRows = numRows || 1; this.numCols = numCols || 1;
+  }
+  getValues() {
+    const out = [];
+    for (let r = 0; r < this.numRows; r++) {
+      const src = this.sheet._data[this.row - 1 + r] || [];
+      const line = [];
+      for (let c = 0; c < this.numCols; c++) {
+        const v = src[this.col - 1 + c];
+        line.push(v === undefined || v === null ? '' : v);
+      }
+      out.push(line);
+    }
+    return out;
+  }
+  getValue() { return this.getValues()[0][0]; }
+  setValues(matrix) {
+    for (let r = 0; r < this.numRows; r++) {
+      const rowIdx = this.row - 1 + r;
+      while (this.sheet._data.length <= rowIdx) this.sheet._data.push([]);
+      const dst = this.sheet._data[rowIdx];
+      const src = (matrix && matrix[r]) || [];
+      for (let c = 0; c < this.numCols; c++) {
+        const colIdx = this.col - 1 + c;
+        while (dst.length <= colIdx) dst.push('');
+        dst[colIdx] = src[c] === undefined ? '' : src[c];
+      }
+    }
+    this.sheet._book._dirty = true;
+    return this;
+  }
+  setValue(v) {
+    const rowIdx = this.row - 1;
+    while (this.sheet._data.length <= rowIdx) this.sheet._data.push([]);
+    const dst = this.sheet._data[rowIdx];
+    while (dst.length <= this.col - 1) dst.push('');
+    dst[this.col - 1] = v === undefined ? '' : v;
+    this.sheet._book._dirty = true;
+    return this;
+  }
+  // Các hàm định dạng: không cần trên máy chủ, giữ để chuỗi lệnh không lỗi
+  setFontWeight() { return this; }
+  setBackground() { return this; }
+  setNumberFormat() { return this; }
+  setFontColor() { return this; }
+  setHorizontalAlignment() { return this; }
+  clearContent() {
+    for (let r = 0; r < this.numRows; r++) {
+      const dst = this.sheet._data[this.row - 1 + r];
+      if (!dst) continue;
+      for (let c = 0; c < this.numCols; c++) {
+        if (dst.length > this.col - 1 + c) dst[this.col - 1 + c] = '';
+      }
+    }
+    this.sheet._book._dirty = true;
+    return this;
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+//  SHEET — một bảng dữ liệu
+// ─────────────────────────────────────────────────────────
+class Sheet {
+  constructor(book, name, data) {
+    this._book = book;
+    this._name = name;
+    this._data = data || [];
+  }
+  getName() { return this._name; }
+  getLastRow() { return this._data.length; }
+  getLastColumn() {
+    let m = 0;
+    for (const r of this._data) if (r.length > m) m = r.length;
+    return m;
+  }
+  getMaxRows() { return Math.max(this._data.length, 1000); }
+  getMaxColumns() { return Math.max(this.getLastColumn(), 40); }
+  getDataRange() {
+    return new Range(this, 1, 1, Math.max(this._data.length, 1), Math.max(this.getLastColumn(), 1));
+  }
+  getRange(row, col, numRows, numCols) {
+    return new Range(this, row, col, numRows || 1, numCols || 1);
+  }
+  appendRow(rowArr) {
+    this._data.push((rowArr || []).map(v => (v === undefined ? '' : v)));
+    this._book._dirty = true;
+    return this;
+  }
+  deleteRow(rowIdx) { // 1-based
+    if (rowIdx >= 1 && rowIdx <= this._data.length) {
+      this._data.splice(rowIdx - 1, 1);
+      this._book._dirty = true;
+    }
+    return this;
+  }
+  deleteRows(rowIdx, howMany) {
+    this._data.splice(rowIdx - 1, howMany || 1);
+    this._book._dirty = true;
+    return this;
+  }
+  clearContents() { this._data = []; this._book._dirty = true; return this; }
+  clear() { return this.clearContents(); }
+  hideSheet() { return this; }
+  showSheet() { return this; }
+  setFrozenRows() { return this; }
+  autoResizeColumns() { return this; }
+}
+
+// ─────────────────────────────────────────────────────────
+//  SPREADSHEET — "file bảng tính" = toàn bộ cơ sở dữ liệu
+// ─────────────────────────────────────────────────────────
+class Spreadsheet {
+  constructor(ownerEmail) {
+    this._sheets = new Map();
+    this._dirty = false;
+    this._ownerEmail = ownerEmail;
+    this._load();
+  }
+  _load() {
+    try {
+      if (fs.existsSync(DATA_FILE)) {
+        const raw = fs.readFileSync(DATA_FILE, 'utf8');
+        const obj = JSON.parse(raw, jsonReviver);
+        for (const name of Object.keys(obj.sheets || {})) {
+          this._sheets.set(name, new Sheet(this, name, obj.sheets[name]));
+        }
+        console.log('[DATA] Đã nạp dữ liệu:', DATA_FILE, '(' + this._sheets.size + ' bảng)');
+      }
+    } catch (e) {
+      console.error('[DATA] LỖI đọc dữ liệu:', e.message);
+      throw e; // không chạy tiếp với dữ liệu hỏng
+    }
+  }
+  save(force) {
+    if (!this._dirty && !force) return;
+    try {
+      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+      const obj = { savedAt: new Date().toISOString(), sheets: {} };
+      for (const [name, sh] of this._sheets) obj.sheets[name] = sh._data;
+      const tmp = DATA_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(obj, jsonReplacer));
+      fs.renameSync(tmp, DATA_FILE); // ghi nguyên tử: không hỏng file khi mất điện giữa chừng
+      this._dirty = false;
+    } catch (e) {
+      console.error('[DATA] LỖI ghi dữ liệu:', e.message);
+    }
+  }
+  backup() {
+    try {
+      if (!fs.existsSync(DATA_FILE)) return;
+      if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      const stamp = Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd_HHmmss');
+      fs.copyFileSync(DATA_FILE, path.join(BACKUP_DIR, 'garage-data_' + stamp + '.json'));
+      // Giữ tối đa 60 bản sao lưu gần nhất
+      const files = fs.readdirSync(BACKUP_DIR).filter(f => f.endsWith('.json')).sort();
+      while (files.length > 60) fs.unlinkSync(path.join(BACKUP_DIR, files.shift()));
+      console.log('[DATA] Đã sao lưu vào data/backups/');
+    } catch (e) { console.error('[DATA] Lỗi sao lưu:', e.message); }
+  }
+  getSheetByName(name) { return this._sheets.get(name) || null; }
+  insertSheet(name) {
+    const sh = new Sheet(this, name, []);
+    this._sheets.set(name, sh);
+    this._dirty = true;
+    return sh;
+  }
+  getSheets() { return Array.from(this._sheets.values()); }
+  getOwner() {
+    const email = this._ownerEmail;
+    return { getEmail: () => email };
+  }
+  getName() { return 'Garage Pro (nội bộ)'; }
+}
+
+// ─────────────────────────────────────────────────────────
+//  CÁC DỊCH VỤ GIẢ LẬP
+// ─────────────────────────────────────────────────────────
+function pad2(n) { return ('0' + n).slice(-2); }
+
+const Utilities = {
+  // Hỗ trợ các mẫu định dạng được dùng trong code.js
+  formatDate(date, tz, pattern) {
+    const d = date instanceof Date ? date : new Date(date);
+    if (isNaN(d.getTime())) return '';
+    // Chuyển về múi giờ GMT+7
+    const t = new Date(d.getTime() + (TZ_OFFSET_MIN + d.getTimezoneOffset()) * 60000);
+    return String(pattern)
+      .replace(/yyyy/g, String(t.getFullYear()))
+      .replace(/MM/g, pad2(t.getMonth() + 1))
+      .replace(/dd/g, pad2(t.getDate()))
+      .replace(/HH/g, pad2(t.getHours()))
+      .replace(/mm/g, pad2(t.getMinutes()))
+      .replace(/ss/g, pad2(t.getSeconds()));
+  },
+  sleep(ms) { const end = Date.now() + ms; while (Date.now() < end) {} },
+  getUuid() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = (Math.random() * 16) | 0;
+      return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+    });
+  }
+};
+
+// Cache trong bộ nhớ (có hạn dùng như CacheService thật)
+class MemCache {
+  constructor() { this._m = new Map(); }
+  get(key) {
+    const it = this._m.get(key);
+    if (!it) return null;
+    if (it.exp && Date.now() > it.exp) { this._m.delete(key); return null; }
+    return it.v;
+  }
+  put(key, value, ttlSec) {
+    this._m.set(key, { v: String(value), exp: ttlSec ? Date.now() + ttlSec * 1000 : 0 });
+  }
+  remove(key) { this._m.delete(key); }
+  removeAll(keys) { (keys || []).forEach(k => this._m.delete(k)); }
+}
+const _scriptCache = new MemCache();
+const _userCache = new MemCache();
+const CacheService = {
+  getScriptCache: () => _scriptCache,
+  getUserCache: () => _userCache
+};
+
+const Logger = { log: (...a) => console.log('[GAS]', ...a) };
+
+// Session: máy chủ nội bộ không có tài khoản Google → trả rỗng.
+// Việc xác thực dựa hoàn toàn vào bảng PhanQuyen (email + mã PIN).
+const Session = {
+  getScriptTimeZone: () => TIMEZONE,
+  getActiveUser: () => ({ getEmail: () => '' }),
+  getEffectiveUser: () => ({ getEmail: () => '' })
+};
+
+// Giao diện Sheets (menu, hộp thoại) — không tồn tại trên máy chủ, chỉ cần không lỗi
+const _fakeMenu = { addItem() { return this; }, addSeparator() { return this; }, addToUi() {} };
+const _fakeUi = {
+  createMenu: () => _fakeMenu,
+  alert: (msg) => console.log('[UI]', msg),
+  showModalDialog: () => {}
+};
+
+const HtmlService = {
+  createTemplateFromFile: () => ({
+    evaluate: () => ({ setWidth() { return this; }, setHeight() { return this; }, setTitle() { return this; }, setXFrameOptionsMode() { return this; } })
+  }),
+  createHtmlOutputFromFile: () => ({ setTitle() { return this; } }),
+  XFrameOptionsMode: { ALLOWALL: 1 }
+};
+
+// LockService: Node chạy đơn luồng, các hàm backend đồng bộ → khóa luôn thành công
+const _fakeLock = { tryLock: () => true, waitLock: () => {}, releaseLock: () => {}, hasLock: () => true };
+const LockService = {
+  getScriptLock: () => _fakeLock,
+  getUserLock: () => _fakeLock,
+  getDocumentLock: () => _fakeLock
+};
+
+// ─────────────────────────────────────────────────────────
+//  KHỞI TẠO
+// ─────────────────────────────────────────────────────────
+function createEnvironment(ownerEmail) {
+  const book = new Spreadsheet(ownerEmail);
+  const SpreadsheetApp = {
+    getActiveSpreadsheet: () => book,
+    getActive: () => book,
+    flush: () => book.save(),
+    getUi: () => _fakeUi
+  };
+  return { book, SpreadsheetApp, Session, Utilities, CacheService, Logger, HtmlService, LockService };
+}
+
+module.exports = { createEnvironment, DATA_FILE, DATA_DIR };

@@ -1,0 +1,16 @@
+{
+  "name": "garage-pro-lan",
+  "version": "1.0.0",
+  "description": "Garage Pro - Quản lý gara ô tô chạy nội bộ (LAN), không cần Internet",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "private": true,
+  "dependencies": {
+    "selfsigned": "^2.4.1"
+  }
+}

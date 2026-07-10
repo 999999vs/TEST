@@ -1,0 +1,79 @@
+================================================================
+  GARAGE PRO — BẬT HTTPS TIN CẬY TRÊN MẠNG LAN (HẾT "KHÔNG BẢO MẬT")
+================================================================
+
+VÌ SAO TRƯỚC ĐÂY CÀI RỒI VẪN BÁO "KHÔNG BẢO MẬT"?
+  Bản cũ dùng MỘT chứng chỉ tự ký vừa đóng vai CA vừa làm cert máy chủ.
+  Chrome/Cốc Cốc đời mới KHÔNG tin loại này dù đã cài, vì một cert CA
+  không được phép dùng trực tiếp làm chứng chỉ máy chủ.
+
+CÁCH MỚI (chuẩn, giống công cụ mkcert):
+  Hệ thống tự tạo:
+    • 1 "CA GỐC" riêng  (certs/ca-cert.pem)  ← ĐÂY là thứ bạn CÀI.
+    • 1 chứng chỉ máy chủ do CA gốc ký, có sẵn localhost + mọi IP LAN.
+  Chỉ cần cài CA GỐC một lần trên mỗi máy → tất cả trình duyệt báo AN TOÀN.
+
+----------------------------------------------------------------
+BƯỚC 0 — KHỞI ĐỘNG LẠI SERVER (bắt buộc sau khi cập nhật)
+  Đóng server đang chạy và chạy lại (node server.js).
+  Lần đầu chạy sẽ tự sinh CA gốc trong thư mục certs/.
+  (Nếu trước đó đã cài cert cũ, hãy gỡ nó ra cho gọn — xem cuối file.)
+
+----------------------------------------------------------------
+BƯỚC 1 — LẤY FILE CA GỐC
+  Cách A (khuyên dùng): trên MÁY CHẠY SERVER, vào thư mục certs/,
+     lấy file  ca-cert.pem , đổi tên thành  garage-pro-ca.crt .
+  Cách B: mở trình duyệt tới  https://<địa-chỉ>:8080/garage-ca.crt
+     (lần đầu sẽ có cảnh báo — bấm "Nâng cao / Vẫn tiếp tục" để tải về).
+  * KHÔNG chia sẻ file ca-key.pem — đó là khóa bí mật, giữ trên máy chủ.
+
+----------------------------------------------------------------
+BƯỚC 2 — CÀI CA GỐC
+
+■ WINDOWS (cho Cốc Cốc, Chrome, Edge — dùng chung kho chứng chỉ Windows)
+  1. Nhấp đúp file garage-pro-ca.crt → "Install Certificate".
+  2. Chọn "Local Machine" (Máy cục bộ) → Next  (cần quyền admin;
+     nếu không có, chọn "Current User").
+  3. Chọn "Place all certificates in the following store" → Browse
+     → chọn "Trusted Root Certification Authorities" (Nhà phát hành
+     chứng chỉ gốc đáng tin cậy) → OK → Next → Finish → Yes.
+  4. ĐÓNG HẲN Cốc Cốc/Chrome (mọi cửa sổ) rồi mở lại.
+  5. Vào https://localhost:8080 (trên máy chủ) hoặc
+     https://<IP-máy-chủ>:8080 (máy khác) → ổ khóa XANH, hết cảnh báo.
+
+■ ANDROID (điện thoại/máy tính bảng)
+  1. Chép file garage-pro-ca.crt vào máy.
+  2. Cài đặt → Bảo mật → Mã hóa & thông tin đăng nhập →
+     "Cài chứng chỉ" → "Chứng chỉ CA" → chọn file.
+     (Máy có thể cảnh báo "mạng có thể bị giám sát" — đúng với CA riêng,
+      cứ tiếp tục.)
+  3. Mở Chrome/Cốc Cốc, vào https://<IP-máy-chủ>:8080.
+
+■ macOS
+  1. Nhấp đúp file → mở Keychain Access → thêm vào "System".
+  2. Tìm "Garage Pro Local CA" → nhấp đúp → mục Trust → chọn
+     "Always Trust" → đóng (nhập mật khẩu máy).
+  3. Mở lại trình duyệt.
+
+----------------------------------------------------------------
+TRUY CẬP TỪ MÁY KHÁC TRONG XƯỞNG
+  • Dùng địa chỉ:  https://<IP-máy-chủ>:8080
+    (xem IP máy chủ ở dòng log khi khởi động server).
+  • Cài CA gốc (Bước 2) trên từng máy → tất cả đều báo an toàn.
+  • Chứng chỉ máy chủ đã kèm sẵn mọi IP LAN nên không lỗi "sai tên".
+    Nếu đổi mạng (IP đổi), server tự cấp lại cert máy chủ — KHÔNG cần
+    cài lại CA (CA gốc giữ nguyên).
+
+----------------------------------------------------------------
+GỠ CHỨNG CHỈ CŨ (nếu đã lỡ cài bản trước)
+  Windows: gõ "certlm.msc" (hoặc certmgr.msc) → Trusted Root
+  Certification Authorities → Certificates → tìm "Garage Pro LAN"
+  (bản cũ) → xóa. Giữ lại "Garage Pro Local CA" (bản mới).
+
+----------------------------------------------------------------
+KHÔNG MUỐN DÙNG HTTPS?
+  Chạy server ở chế độ HTTP:  đặt biến môi trường GARAGE_HTTP=1
+  Lưu ý: http://localhost KHÔNG bị cảnh báo, nhưng http qua IP LAN sẽ
+  hiện "không bảo mật" và KHÔNG mã hóa đường truyền. Với xưởng cần bảo
+  mật, nên dùng HTTPS + CA như trên.
+================================================================
